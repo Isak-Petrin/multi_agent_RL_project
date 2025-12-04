@@ -94,7 +94,7 @@ class ClashRoyaleEnv(gym.Env):
 
     def _spawn_random_friendly(self, row: int, col: int):
         """Spawn a random friendly troop at the specified cell."""
-        troop_choices = [Skeleton]  # Extend here with more troop classes
+        troop_choices = [Troop, Archer, Skeleton]  # Extend here with more troop classes
         idx = int(self.rng.integers(0, len(troop_choices)))
         troop_cls = troop_choices[idx]
         self._spawn_troop(friendly=True, row=row, col=col, troop_cls=troop_cls)
