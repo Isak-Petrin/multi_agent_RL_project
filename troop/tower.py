@@ -13,6 +13,7 @@ class Tower:
         self.owner = "player" if friendly else "enemy"
         self.x = x
         self.y = y
+        self.is_building = True
         self.hp = hp
         self.max_hp = hp
         self.attack_speed = attack_speed

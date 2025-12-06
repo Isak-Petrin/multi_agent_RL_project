@@ -1,6 +1,10 @@
 from troop.troop import Troop
+
+
 class Skeleton(Troop):
-    def __init__(self, id, friendly, x, y):
+    DEFAULT_COST = 2
+
+    def __init__(self, id, friendly, x, y, cost=None):
         super().__init__(
             id = id,
             friendly= friendly,
@@ -8,11 +12,12 @@ class Skeleton(Troop):
             y = y,
             hp = 32,
             attack_speed = 20,
-            speed = 0.10,
-            attack_range = 1,
+            speed = 1.1,
+            attack_range = 1.1,
             sight_range = 5.5,
             targets="ground",
             size=0.6,
-            attack_damage = 32,
+            attack_damage = 35,
+            cost=cost,
         )
             

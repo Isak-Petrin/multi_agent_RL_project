@@ -1,4 +1,6 @@
 class Troop:
+    DEFAULT_COST = 4
+
     def __init__(
         self,
         id: int,
@@ -11,12 +13,20 @@ class Troop:
         attack_range: float,
         sight_range: float,
         targets="ground",
+        target_type: str = "all",
         size=0.6,
         attack_damage: int = 10,
+        cost: int | None = None,
         name: str | None = None,
     ):
+        valid_target_types = {"troops", "towers", "all"}
+        if target_type not in valid_target_types:
+            raise ValueError(
+                f"Invalid target_type '{target_type}'. Expected one of {valid_target_types}."
+            )
         self.id = id
         self.name = name or type(self).__name__
+        self.is_troop = True
         # True if troop is owned by player and False if troop is owned by opposition
         self.friendly = friendly
         self.owner = "player" if friendly else "enemy"
@@ -33,6 +43,10 @@ class Troop:
         self.sight_range = sight_range
         self.size = size
         self.attack_damage = attack_damage
+        self.cost = self.DEFAULT_COST if cost is None else cost
+        self.target_type = target_type
+        self.targets_towers = target_type in {"towers", "all"}
+        self.targets_troops = target_type in {"troops", "all"}
 
         self.max_hp = hp
         self.time_since_attack = 0.0
@@ -55,21 +69,19 @@ class Troop:
             self._move_towards_target(dt, nav_target)
 
     def _acquire_target(self, env):
-        # Find all enemy troops we are allowed to target (air/ground rules)
-        enemies = [
-            t
-            for t in env.troops
-            if t.owner != self.owner
-            and t.hp > 0
-            and self._can_target(t)
-        ]
+        candidates = []
+        if self.targets_troops:
+            candidates.extend(
+                t
+                for t in env.troops
+                if t.owner != self.owner and t.hp > 0 and self._can_target(t)
+            )
 
-        enemy_towers = []
-        for tower in env.get_enemy_towers(self.owner):
-            if tower.hp > 0 and self._can_target(tower):
-                enemy_towers.append(tower)
+        if self.targets_towers:
+            for tower in env.get_enemy_towers(self.owner):
+                if tower.hp > 0 and self._can_target(tower):
+                    candidates.append(tower)
 
-        candidates = enemies + enemy_towers
         if not candidates:
             return None
 
@@ -89,6 +101,10 @@ class Troop:
         if self.target.hp <= 0:
             return True
         if self.distance_to(self.target) > self.sight_range:
+            return True
+        if getattr(self.target, "is_building", False) and not self.targets_towers:
+            return True
+        if getattr(self.target, "is_troop", False) and not self.targets_troops:
             return True
         return False
 

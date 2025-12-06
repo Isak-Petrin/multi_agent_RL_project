@@ -10,18 +10,20 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.append(str(PROJECT_ROOT))
 
 from troop.archer import Archer
+from troop.giant import Giant
 from troop.tower import Tower
 from troop.troop import Troop
 from troop.skeleton import Skeleton
 
 color_map = {"Archer": (179, 0, 255),
              "Skeleton": (255,255,255),
-             "Troop": (0,0,0)}
+             "Troop": (0,0,0),
+             "Giant": (255, 180, 0)}
 
 class ClashRoyaleEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 60}
 
-    def __init__(self, max_steps: int = 10000, enemy_spawn_every: int = 500):
+    def __init__(self, max_steps: int = 10000, enemy_spawn_every: int = 180):
         super().__init__()
         self.rows = 32
         self.cols = 18
@@ -44,7 +46,9 @@ class ClashRoyaleEnv(gym.Env):
         # Rendering attributes
         self.tile_size = 25
         self.width = self.cols * self.tile_size
-        self.height = self.rows * self.tile_size
+        self.arena_height = self.rows * self.tile_size
+        self.ui_panel_height = 110
+        self.height = self.arena_height + self.ui_panel_height
         self.screen = None
         self.clock = None
         self.initialized = False
@@ -75,7 +79,16 @@ class ClashRoyaleEnv(gym.Env):
         self.step_count = 0
         self.rng = np.random.default_rng()
         self._next_id = 0
-        self.sim_substeps = 4  # smaller dt increments per env step to smooth motion
+        self.sim_substeps = 20  # smaller dt increments per env step to smooth motion
+        self.player_hand = [Troop, Archer, Skeleton, Giant]
+        self.selected_hand_index = 0
+        self.max_elixir = 10.0
+        self.base_elixir_rate = 1.0 / 2.8
+        self.double_elixir_rate = 1.0 / 1.4
+        self.double_elixir_time = 60.0  # seconds
+        self.player_elixir = 5.0
+        self.enemy_elixir = 5.0
+        self.elapsed_time = 0.0
 
     def seed(self, seed=None):
         self.rng = np.random.default_rng(seed)
@@ -88,16 +101,27 @@ class ClashRoyaleEnv(gym.Env):
         self._init_towers()
         self.step_count = 0
         self._next_id = 0
+        self.player_elixir = 5.0
+        self.enemy_elixir = 5.0
+        self.elapsed_time = 0.0
+        self.selected_hand_index = 0
         self._place_towers()
         observation = self._update_grid()
         return observation, {}
 
     def _spawn_random_friendly(self, row: int, col: int):
         """Spawn a random friendly troop at the specified cell."""
-        troop_choices = [Troop, Archer, Skeleton]  # Extend here with more troop classes
+        troop_choices = [Troop, Archer, Skeleton, Giant]  # Extend here with more troop classes
         idx = int(self.rng.integers(0, len(troop_choices)))
         troop_cls = troop_choices[idx]
-        self._spawn_troop(friendly=True, row=row, col=col, troop_cls=troop_cls)
+        return self._spawn_troop(friendly=True, row=row, col=col, troop_cls=troop_cls)
+
+    def _spawn_selected_friendly(self, row: int, col: int):
+        """Spawn the currently selected card from the player's hand."""
+        if not self.player_hand:
+            return False
+        troop_cls = self.player_hand[self.selected_hand_index % len(self.player_hand)]
+        return self._spawn_troop(friendly=True, row=row, col=col, troop_cls=troop_cls)
 
     def _init_towers(self):
         center_col = self.cols // 2
@@ -105,7 +129,7 @@ class ClashRoyaleEnv(gym.Env):
             friendly=False,
             x=0.0,
             y=float(center_col),
-            hp=4500,
+            hp=2500,
             attack_speed=20,  # slower cadence so troops can approach
             attack_range=7,  # outranged by archers to make chip damage possible
             attack_damage=58,
@@ -114,7 +138,7 @@ class ClashRoyaleEnv(gym.Env):
             friendly=True,
             x=float(self.rows - 1),
             y=float(center_col),
-            hp=4500,
+            hp=2500,
             attack_speed=20,
             attack_range=7,
             attack_damage=58,
@@ -122,19 +146,25 @@ class ClashRoyaleEnv(gym.Env):
 
     def step(self, action):
         self.step_count += 1
-        reward = -0.01  # small step penalty
+        
+        # 1. Base Time Penalty (Encourage winning fast)
+        reward = -0.01 
         done = False
 
-        self._handle_player_action(action)
+        # 2. Handle Action & Apply Invalid Action Penalty
+        # (Change _handle_player_action to return the penalty calculated in A)
+        invalid_action_penalty = self._handle_player_action(action)
+        reward += invalid_action_penalty
+
         self._maybe_spawn_enemy()
 
         prev_enemy_hp = self.enemy_tower.hp if self.enemy_tower else 0
         prev_player_hp = self.player_tower.hp if self.player_tower else 0
 
-        # Advance simulation by one tick
+        # --- Physics Loop (Unchanged) ---
         dt = 1.0 / self.sim_substeps
         for _ in range(self.sim_substeps):
-            # Share troop list for cheap separation pushes in movement
+            self._update_elixir(dt)
             alive_troops = [t for t in self.troops if t.hp > 0]
             for t in alive_troops:
                 t._env_cache = alive_troops
@@ -142,37 +172,116 @@ class ClashRoyaleEnv(gym.Env):
                 prev_x = troop.x
                 troop.update(dt, self)
                 self._block_river_crossing(troop, prev_x)
-            # Resolve any overlaps after movement/river blocking
             self._separate_overlaps()
-            # Towers attack during each substep to keep in sync with troops
             if self.enemy_tower:
                 self.enemy_tower.update(dt, self)
             if self.player_tower:
                 self.player_tower.update(dt, self)
-            # Let troops attack towers directly when in range
             self._troop_vs_tower_attacks()
+        # --------------------------------
 
-        # Tower interactions and cleanup
-        reward += self._resolve_tower_damage(prev_enemy_hp, prev_player_hp)
-        reward += self._cleanup_dead_troops()
+        # 3. Resolve Tower Damage (Dense Reward)
+        # Using 0.1 scale
+        tower_reward = self._resolve_tower_damage(prev_enemy_hp, prev_player_hp)
+        reward += tower_reward
 
-        # Termination checks
+        # 4. Resolve Elixir Trades (Strategic Reward)
+        # This replaces the simple +/- 1.0 logic
+        elixir_reward = self._cleanup_dead_troops()
+        reward += elixir_reward
+
+        # 5. Winning / Losing (Terminal Reward)
+        # Increase the magnitude to overpower the accumulated step penalties
         if self.enemy_tower and self.enemy_tower.hp <= 0:
             done = True
-            reward += 20.0
+            reward += 100.0 # Big bonus for the kill
         if self.player_tower and self.player_tower.hp <= 0:
             done = True
-            reward -= 20.0
+            reward -= 100.0
         if self.step_count >= self.max_steps:
             done = True
+            # Optional: Tie-breaker reward based on HP difference?
+            # hp_diff = (self.player_tower.hp - self.enemy_tower.hp) / 100.0
+            # reward += hp_diff
 
         observation = self._update_grid()
+        
+        # Useful for debugging training performance in Tensorboard
         info = {
             "enemy_tower_hp": self.enemy_tower.hp if self.enemy_tower else 0,
             "player_tower_hp": self.player_tower.hp if self.player_tower else 0,
             "troop_count": len(self.troops),
+            "player_elixir": self.player_elixir,
+            "rewards/tower": tower_reward,
+            "rewards/elixir": elixir_reward,
+            "rewards/invalid": invalid_action_penalty,
+            "troop_placement": self.troops
         }
         return observation, reward, done, False, info
+
+    def step_self_play(self, bottom_action: int, top_action: int):
+        """
+        Advance the game with actions from both sides while keeping each agent's ego
+        perspective (both think they deploy from the bottom). Dynamics remain unchanged;
+        this only alters how actions/observations are mapped for the enemy side.
+        """
+        self.step_count += 1
+        reward_bottom = -0.01
+        done = False
+
+        # Apply both agents' spawn actions (top action is flipped into world coords)
+        self._handle_spawn_action(bottom_action, friendly=True)
+        top_world_action = self._ego_action_to_world(top_action, friendly=False)
+        self._handle_spawn_action(top_world_action, friendly=False)
+
+        prev_enemy_hp = self.enemy_tower.hp if self.enemy_tower else 0
+        prev_player_hp = self.player_tower.hp if self.player_tower else 0
+
+        dt = 1.0 / self.sim_substeps
+        for _ in range(self.sim_substeps):
+            self._update_elixir(dt)
+            alive_troops = [t for t in self.troops if t.hp > 0]
+            for t in alive_troops:
+                t._env_cache = alive_troops
+            for troop in list(self.troops):
+                prev_x = troop.x
+                troop.update(dt, self)
+                self._block_river_crossing(troop, prev_x)
+            self._separate_overlaps()
+            if self.enemy_tower:
+                self.enemy_tower.update(dt, self)
+            if self.player_tower:
+                self.player_tower.update(dt, self)
+            self._troop_vs_tower_attacks()
+
+        reward_bottom += self._resolve_tower_damage(prev_enemy_hp, prev_player_hp)
+        reward_bottom += self._cleanup_dead_troops()
+
+        if self.enemy_tower and self.enemy_tower.hp <= 0:
+            done = True
+            reward_bottom += 20.0
+        if self.player_tower and self.player_tower.hp <= 0:
+            done = True
+            reward_bottom -= 20.0
+        if self.step_count >= self.max_steps:
+            done = True
+
+        world_obs = self._update_grid()
+        obs_bottom = world_obs.copy()
+        obs_top = self._ego_observation_from_grid(world_obs, friendly=False)
+
+        reward_top = -reward_bottom  # zero-sum mirror of bottom reward
+        info = {
+            "enemy_tower_hp": self.enemy_tower.hp if self.enemy_tower else 0,
+            "player_tower_hp": self.player_tower.hp if self.player_tower else 0,
+            "troop_count": len(self.troops),
+            "player_elixir": self.player_elixir,
+            "enemy_elixir": self.enemy_elixir,
+            "elapsed_time": self.elapsed_time,
+            "bottom_action": bottom_action,
+            "top_action_world": top_world_action,
+        }
+        return (obs_bottom, obs_top), (reward_bottom, reward_top), done, False, info
 
     def get_navigation_target(self, troop: Troop, target: Troop | None):
         """Return a waypoint for the troop to move toward, respecting bridges."""
@@ -222,42 +331,142 @@ class ClashRoyaleEnv(gym.Env):
             return [t for t in [self.enemy_tower] if t]
         return [t for t in [self.player_tower] if t]
 
-    def _handle_player_action(self, action: int):
+    def _valid_spawn_cell(self, friendly: bool, row: int, col: int) -> bool:
+        """Check if a spawn cell is valid for the given side."""
+        if not (0 <= row < self.rows and 0 <= col < self.cols):
+            return False
+        if row == self.river_row:
+            return False
+        if self.grid[row, col] != 0:
+            return False
+        if friendly:
+            return row >= self.rows - 3
+        return row < 3
+    """
+    def _handle_spawn_action(self, action: int, friendly: bool) -> bool:
         if action == 0:
-            return
+            return False
         action -= 1
         row = action // self.cols
         col = action % self.cols
+        if not self._valid_spawn_cell(friendly, row, col):
+            return False
+        return bool(self._spawn_troop(friendly=friendly, row=row, col=col))
+    
+    # In your Class...
+    """
 
-        # Only allow spawning on the player's side (bottom three rows) and empty cell
-        if row < self.rows - 3:
-            return
-        if row == self.river_row:
-            return
-        if self.grid[row, col] != 0:
-            return
+    def _handle_spawn_action(self, action: int, friendly: bool) -> float:
+        """
+        Handle a discrete spawn action.
+        Returns: A small negative reward if the move was invalid (e.g. not enough elixir), else 0.0
+        """
+        if action == 0:
+            return 0.0 # No-op is always valid and costs nothing
+        
+        # Parse action
+        action_idx = action - 1
+        row = action_idx // self.cols
+        col = action_idx % self.cols
+        
+        # 1. Check bounds/validity
+        if not self._valid_spawn_cell(friendly, row, col):
+            return -0.1  # Penalty for trying to spawn in river or on top of another unit
+            
+        # 2. Determine troop type (Logic from your original code needs to be accessible here)
+        # Assuming you determine class randomly or via action, let's look at how you did it in _spawn_troop.
+        # NOTE: To strictly calculate cost before spawning, we need the intended class.
+        # For this example, let's assume the agent selects the card type in the action 
+        # (if your action space separates Card/Position). 
+        # If your current code spawns a RANDOM troop, the agent can't predict cost. 
+        # Assuming for now we just penalize the spawn attempt if it failed due to funds:
+        
+        spawned = self._spawn_troop(friendly=friendly, row=row, col=col)
+        if not spawned:
+            # If _spawn_troop returned False, it was likely due to insufficient elixir
+            return -0.05 
+            
+        return 0.0
 
-        self._spawn_troop(
-            friendly=True,
-            row=row,
-            col=col,
-        )
+    def _current_elixir_rate(self) -> float:
+        if self.elapsed_time >= self.double_elixir_time:
+            return self.double_elixir_rate
+        return self.base_elixir_rate
+
+    def _format_time(self, seconds: float) -> str:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes:02d}:{secs:02d}"
+
+    def _update_elixir(self, dt: float):
+        rate = self._current_elixir_rate()
+        self.player_elixir = min(self.max_elixir, self.player_elixir + rate * dt)
+        self.enemy_elixir = min(self.max_elixir, self.enemy_elixir + rate * dt)
+        self.elapsed_time += dt
+
+    def _get_troop_cost(self, troop_cls) -> float:
+        if troop_cls is None:
+            troop_cls = Troop
+        return float(getattr(troop_cls, "DEFAULT_COST", 1))
+
+    def _try_pay_elixir(self, friendly: bool, cost: float) -> bool:
+        if friendly:
+            if self.player_elixir < cost:
+                return False
+            self.player_elixir -= cost
+            return True
+        if self.enemy_elixir < cost:
+            return False
+        self.enemy_elixir -= cost
+        return True
+
+    def _ego_action_to_world(self, action: int, friendly: bool) -> int:
+        """Convert an ego-centric action to world coordinates (vertical flip for enemy)."""
+        if friendly or action == 0:
+            return action
+        action -= 1
+        row = action // self.cols
+        col = action % self.cols
+        world_row = (self.rows - 1) - row
+        world_col = col
+        return world_row * self.cols + world_col + 1
+
+    def _ego_observation_from_grid(self, grid: np.ndarray, friendly: bool) -> np.ndarray:
+        """Return a perspective-correct grid for the given side (enemy sees itself as positive)."""
+        if friendly:
+            return grid.copy()
+        flipped = np.flipud(grid)
+        return -flipped
+
+    def get_ego_observation(self, friendly: bool) -> np.ndarray:
+        """Public helper to obtain an ego-centric observation without altering state."""
+        grid = self._update_grid()
+        return self._ego_observation_from_grid(grid, friendly)
+
+    def _handle_player_action(self, action: int) -> float:
+        """Process the player's action and return any invalid-action penalty."""
+        penalty = self._handle_spawn_action(action, friendly=True)
+        # _handle_spawn_action should always return a float, but guard against None to avoid TypeErrors.
+        return 0.0 if penalty is None else float(penalty)
 
     def _maybe_spawn_enemy(self):
         if self.step_count % self.enemy_spawn_every != 0:
             return
         col = int(self.rng.integers(0, self.cols))
         row = int(self.rng.integers(0, 2))  # spawn near the top
-        if row == self.river_row:
-            return
-        if self.grid[row, col] != 0:
+        if not self._valid_spawn_cell(friendly=False, row=row, col=col):
             return
         self._spawn_troop(friendly=False, row=row, col=col)
 
     def _spawn_troop(self, friendly: bool, row: int, col: int, troop_cls=None):
         """Spawn a troop of the given class (defaults to random)."""
         if troop_cls is None:
-            troop_cls = [Troop, Archer][int(self.rng.integers(0, 2))]
+            troop_pool = [Troop, Archer, Skeleton, Giant]
+            troop_cls = troop_pool[int(self.rng.integers(0, len(troop_pool)))]
+
+        cost = self._get_troop_cost(troop_cls)
+        if not self._try_pay_elixir(friendly, cost):
+            return False
 
         if troop_cls is Archer:
             troop = [Archer(id=self._next_id, friendly=friendly, x=float(row), y=float(col - 0.7)), 
@@ -267,18 +476,25 @@ class ClashRoyaleEnv(gym.Env):
                      Skeleton(id=self._next_id, friendly=friendly, x=float(row), y=float(col + 1)),
                      Skeleton(id=self._next_id, friendly=friendly, x=float(row), y=float(col - 1))
                      ]
+        elif troop_cls is Giant:
+            troop = Giant(
+                id=self._next_id,
+                friendly=friendly,
+                x=float(row),
+                y=float(col),
+            )
         else:
             troop = Troop(
                 id=self._next_id,
                 friendly=friendly,
                 x=float(row),
                 y=float(col),
-                hp=760,
-                attack_speed=20,
-                speed=0.07,
+                hp=288,
+                attack_speed=1.3,
+                speed=1.2,
                 attack_range=1,
-                sight_range=11,
-                attack_damage = 86,
+                sight_range=5.5,
+                attack_damage = 82,
             )
 
         self._next_id += 1
@@ -287,23 +503,33 @@ class ClashRoyaleEnv(gym.Env):
                 self.troops.append(t)
         else:
             self.troops.append(troop)
+        return True
 
     def _cleanup_dead_troops(self) -> float:
-        reward = 0.0
-        alive = []
-        for troop in self.troops:
-            if troop.hp <= 0:
-                reward += 1.0 if troop.owner == "enemy" else -1.0
-            else:
-                alive.append(troop)
-        self.troops = alive
-        return reward
+            reward = 0.0
+            alive = []
+            for troop in self.troops:
+                if troop.hp <= 0:
+                    # Calculate Elixir Value of the dead unit
+                    # You need to ensure every troop instance has a .cost attribute or map it here
+                    unit_cost = self._get_troop_cost(type(troop))
+                    
+                    if troop.owner == "enemy":
+                        # We killed an enemy! Reward = value of that enemy
+                        reward += unit_cost * 1.0 
+                    else:
+                        # We lost a unit! Penalty = value of that unit
+                        reward -= unit_cost * 1.0
+                else:
+                    alive.append(troop)
+            self.troops = alive
+            return reward
 
     def _resolve_tower_damage(self, prev_enemy_hp: float, prev_player_hp: float) -> float:
         reward = 0.0
         # Contact damage when troops reach tower row (legacy Clash-like behavior)
         for troop in self.troops:
-            if troop.hp <= 0:
+            if troop.hp <= 0 or not getattr(troop, "targets_towers", False):
                 continue
             # Friendly troops reaching enemy tower
             if troop.friendly and troop.x <= 0.0 and self.enemy_tower and self.enemy_tower.hp > 0:
@@ -322,7 +548,7 @@ class ClashRoyaleEnv(gym.Env):
 
     def _troop_vs_tower_attacks(self):
         for troop in self.troops:
-            if troop.hp <= 0:
+            if troop.hp <= 0 or not getattr(troop, "targets_towers", False):
                 continue
             for tower in self.get_enemy_towers(troop.owner):
                 if not tower or tower.hp <= 0:
@@ -484,7 +710,7 @@ class ClashRoyaleEnv(gym.Env):
                 center_col * self.tile_size,
                 (self.river_row + 1) * self.tile_size,
                 self.tile_size,
-                self.height - (self.river_row + 1) * self.tile_size,
+                self.arena_height - (self.river_row + 1) * self.tile_size,
             ),
         )
 
@@ -497,7 +723,7 @@ class ClashRoyaleEnv(gym.Env):
                     bridge_col * self.tile_size,
                     0,
                     self.tile_size,
-                    self.height,
+                    self.arena_height,
                 ),
             )
 
@@ -510,7 +736,7 @@ class ClashRoyaleEnv(gym.Env):
             self.path_color,
             pygame.Rect(
                 (center_col - 1) * self.tile_size,
-                self.height - 3 * self.tile_size - padding,
+                self.arena_height - 3 * self.tile_size - padding,
                 3 * self.tile_size,
                 thickness,
             ),
@@ -566,6 +792,64 @@ class ClashRoyaleEnv(gym.Env):
                     1,
                 )
 
+    def _draw_elixir_ui(self):
+        panel_top = self.arena_height
+        panel_rect = pygame.Rect(0, panel_top, self.width, self.ui_panel_height)
+        pygame.draw.rect(self.screen, (60, 45, 80), panel_rect)
+        pygame.draw.rect(self.screen, (110, 90, 140), panel_rect, 2)
+
+        card_w = 80
+        card_h = self.ui_panel_height - 40
+        card_pad = 14
+        card_y = panel_top + 8
+        for i, troop_cls in enumerate(self.player_hand):
+            x = card_pad + i * (card_w + card_pad)
+            card_rect = pygame.Rect(x, card_y, card_w, card_h)
+            selected = i == (self.selected_hand_index % max(1, len(self.player_hand)))
+            cost = self._get_troop_cost(troop_cls)
+            affordable = self.player_elixir >= cost
+            fill_color = (130, 110, 90) if affordable else (80, 70, 80)
+            pygame.draw.rect(self.screen, fill_color, card_rect, border_radius=8)
+            border_color = (230, 200, 90) if selected else (30, 30, 30)
+            pygame.draw.rect(self.screen, border_color, card_rect, width=3 if selected else 2, border_radius=8)
+
+            name_label = troop_cls.__name__
+            name_surf = self.font.render(name_label, True, (240, 240, 240))
+            name_rect = name_surf.get_rect(center=(card_rect.centerx, card_rect.top + 14))
+            self.screen.blit(name_surf, name_rect)
+
+            cost_radius = 14
+            cost_center = (card_rect.centerx, card_rect.bottom - cost_radius - 4)
+            bubble_color = (200, 70, 200) if affordable else (120, 80, 130)
+            pygame.draw.circle(self.screen, bubble_color, cost_center, cost_radius)
+            cost_surf = self.font.render(str(int(cost)), True, (255, 255, 255))
+            cost_rect = cost_surf.get_rect(center=cost_center)
+            self.screen.blit(cost_surf, cost_rect)
+
+        bar_margin = 12
+        bar_height = 18
+        bar_y = panel_top + self.ui_panel_height - bar_height - 10
+        bar_rect = pygame.Rect(bar_margin, bar_y, self.width - 2 * bar_margin, bar_height)
+        pygame.draw.rect(self.screen, (40, 30, 60), bar_rect, border_radius=10)
+        ratio = max(0.0, min(1.0, self.player_elixir / self.max_elixir))
+        fill_rect = pygame.Rect(bar_rect.x, bar_rect.y, int(bar_rect.width * ratio), bar_height)
+        pygame.draw.rect(self.screen, (230, 80, 210), fill_rect, border_radius=10)
+        pygame.draw.rect(self.screen, (210, 180, 230), bar_rect, 2, border_radius=10)
+
+        elixir_text = f"Elixir: {self.player_elixir:.1f}/{int(self.max_elixir)}"
+        elixir_surf = self.font.render(elixir_text, True, (245, 245, 245))
+        self.screen.blit(elixir_surf, (bar_rect.x + 8, bar_rect.y - 18))
+
+        rate = self._current_elixir_rate()
+        if self.elapsed_time >= self.double_elixir_time:
+            status_text = f"2x Elixir ({rate:.2f}/s)"
+        else:
+            eta = max(0, self.double_elixir_time - self.elapsed_time)
+            status_text = f"2x in {int(eta)}s ({rate:.2f}/s)"
+        status_surf = self.font.render(status_text, True, (240, 220, 250))
+        status_rect = status_surf.get_rect(right=self.width - bar_margin, centery=bar_rect.y - 10)
+        self.screen.blit(status_surf, status_rect)
+
     def render(self):
         if not self.initialized:
             pygame.init()
@@ -579,8 +863,18 @@ class ClashRoyaleEnv(gym.Env):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
+            if event.type == pygame.KEYDOWN:
+                if pygame.K_1 <= event.key <= pygame.K_4:
+                    idx = event.key - pygame.K_1
+                    if idx < len(self.player_hand):
+                        self.selected_hand_index = idx
+                elif event.key == pygame.K_TAB:
+                    if self.player_hand:
+                        self.selected_hand_index = (self.selected_hand_index + 1) % len(self.player_hand)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+                if my >= self.arena_height:
+                    continue  # clicked on UI panel
                 row = int(my // self.tile_size)
                 col = int(mx // self.tile_size)
                 # Only allow spawns on player's side (below the river) and on empty cells
@@ -590,8 +884,8 @@ class ClashRoyaleEnv(gym.Env):
                     and row > self.river_row
                     and self.grid[row, col] == 0
                 ):
-                    self._spawn_random_friendly(row=row, col=col)
-                    self._update_grid()
+                    if self._spawn_selected_friendly(row=row, col=col):
+                        self._update_grid()
 
         for r in range(self.grid.shape[0]):
             for c in range(self.grid.shape[1]):
@@ -667,6 +961,9 @@ class ClashRoyaleEnv(gym.Env):
                     1,
                 )
 
+        # Elixir / hand UI
+        self._draw_elixir_ui()
+
         # HUD overlay
         friendly_count = sum(1 for t in self.troops if t.friendly and t.hp > 0)
         enemy_count = sum(1 for t in self.troops if (not t.friendly) and t.hp > 0)
@@ -676,6 +973,8 @@ class ClashRoyaleEnv(gym.Env):
             f"Enemy tower HP: {self.enemy_tower.hp if self.enemy_tower else 0}",
             f"Friendly troops: {friendly_count}",
             f"Enemy troops: {enemy_count}",
+            f"Elixir: {self.player_elixir:.1f}/{self.max_elixir}",
+            f"Time: {self._format_time(self.elapsed_time)}",
         ]
         hud_bg = pygame.Rect(5, 5, 200, 100)
         pygame.draw.rect(self.screen, (30, 30, 30), hud_bg)
